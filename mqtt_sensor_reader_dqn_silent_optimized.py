@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MQTT Sensor Data Reader with PUF Obfuscation - DQN Priority System (Silent Mode - Optimized)
+MQTT Sensor Data Reader with PUF Obfuscation - PPO Actor-Critic Priority System (Silent Mode - Optimized)
 Date: 2025-09-14
 Author: foladlo
 """
@@ -17,134 +17,217 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.distributions import Categorical
 import random
-from collections import deque, defaultdict
+from collections import defaultdict
 from datetime import datetime, timedelta
 from puf_interface import PUFInterface, create_puf_interface, get_available_serial_ports
 
-class DQN(nn.Module):
+class ActorCritic(nn.Module):
     def __init__(self, state_size=12, action_size=2, hidden_size=64):
-        super(DQN, self).__init__()
-        self.fc1 = nn.Linear(state_size, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, hidden_size)
-        self.fc3 = nn.Linear(hidden_size, action_size)
-        
-    def forward(self, x):
-        x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
-        return self.fc3(x)
+        super().__init__()
+        self.actor = nn.Sequential(
+            nn.Linear(state_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, action_size)
+        )
+        self.critic = nn.Sequential(
+            nn.Linear(state_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, 1)
+        )
 
-class DQNAgent:
-    def __init__(self, state_size=12, action_size=2, learning_rate=0.001):
+    def forward(self, x):
+        policy_logits = self.actor(x)
+        value = self.critic(x)
+        return policy_logits, value
+
+
+class RolloutBuffer:
+    def __init__(self):
+        self.clear()
+
+    def add(self, state, action, reward, log_prob, value, done):
+        self.states.append(np.array(state, dtype=np.float32))
+        self.actions.append(action)
+        self.rewards.append(reward)
+        self.log_probs.append(log_prob)
+        self.values.append(value)
+        self.dones.append(done)
+
+    def clear(self):
+        self.states = []
+        self.actions = []
+        self.rewards = []
+        self.log_probs = []
+        self.values = []
+        self.dones = []
+
+    def __len__(self):
+        return len(self.states)
+
+
+class PPOAgent:
+    def __init__(self, state_size=12, action_size=2, learning_rate=0.0003):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.state_size = state_size
         self.action_size = action_size
-        self.memory = deque(maxlen=1000)  # Reduced from 10000
-        self.epsilon = 1.0
-        self.epsilon_min = 0.01
-        self.epsilon_decay = 0.99  # Faster decay from 0.995
         self.learning_rate = learning_rate
-        self.batch_size = 16  # Reduced from 32
-        self.target_update = 100
-        self.training_steps = 0
-        
-        # Networks
-        self.q_network = DQN(state_size, action_size).to(self.device)
-        self.target_network = DQN(state_size, action_size).to(self.device)
-        self.optimizer = optim.Adam(self.q_network.parameters(), lr=learning_rate)
-        
-        # Copy weights to target network
-        self.update_target_network()
-        
-    def update_target_network(self):
-        self.target_network.load_state_dict(self.q_network.state_dict())
-        
-    def remember(self, state, action, reward, next_state, done):
-        self.memory.append((state, action, reward, next_state, done))
-        
+
+        self.gamma = 0.99
+        self.gae_lambda = 0.95
+        self.clip_range = 0.2
+        self.entropy_coef = 0.01
+        self.value_coef = 0.5
+        self.update_epochs = 4
+        self.mini_batch_size = 16
+        self.update_interval = 32
+        self.warmup_steps = 200
+
+        self.model = ActorCritic(state_size, action_size).to(self.device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
+
+        self.buffer = RolloutBuffer()
+        self.training_steps = 0  # Number of PPO updates
+        self.total_samples = 0   # Number of samples collected
+
     def act(self, state, sensor_priority, location_priority):
-        # Emergency override for deadline approaching
         time_ratio = state[0]
         urgency = state[1]
         is_critical = state[10]
-        
-        # Force transmit if very urgent or critical
+        battery_priority = state[11]
+
+        # Emergency override for deadline approaching
         if time_ratio < 0.1 or (is_critical > 0.5 and time_ratio < 0.5):
-            return 1
-        
-        # Early training phase - priority-based decisions
-        if self.training_steps < 200:
-            battery_priority = state[11]
-            
+            return 1, None, None, False
+
+        # Priority-driven warmup before PPO policy takes over
+        if self.training_steps < self.warmup_steps:
             base_prob = 0.6
             priority_boost = (sensor_priority * location_priority) / 12.0
             urgency_boost = urgency * 0.3
             critical_boost = is_critical * 0.4
             battery_boost = battery_priority * 0.2
-            
+
             transmission_prob = min(0.95, base_prob + priority_boost + urgency_boost + critical_boost + battery_boost)
-            
-            if random.random() < transmission_prob:
-                return 1
-            else:
-                return 0
-        
-        # Override for critical sensors or critical values or low battery
-        if sensor_priority >= 3.0 or state[10] > 0.5 or state[11] > 0.8:
-            if urgency > 0.8 and random.random() < 0.9:
-                return 1
-        
-        # Adjust epsilon based on priority, critical status, and battery
-        priority_factor = sensor_priority * location_priority / 3.0
-        critical_factor = 1.0 + state[10]
-        battery_factor = 1.0 + state[11]
-        
-        adjusted_epsilon = self.epsilon / (priority_factor * critical_factor * battery_factor)
-        
-        if random.random() <= adjusted_epsilon:
-            return random.randrange(self.action_size)
-            
+            action = 1 if random.random() < transmission_prob else 0
+            return action, None, None, False
+
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-        q_values = self.q_network(state_tensor)
-        return np.argmax(q_values.cpu().data.numpy())
-        
-    def replay(self):
-        if len(self.memory) < self.batch_size:
+        logits, value = self.model(state_tensor)
+
+        # Bias the logits for higher priority/urgency situations
+        priority_factor = max(sensor_priority * location_priority / 3.0, 0.1)
+        critical_factor = 1.0 + is_critical
+        battery_factor = 1.0 + battery_priority
+        adjustment = float(np.clip(np.log(priority_factor * critical_factor * battery_factor), -2.0, 2.0))
+
+        adjustment_vector = torch.zeros_like(logits)
+        if adjustment != 0.0 and adjustment_vector.shape[1] > 1:
+            adjustment_vector[:, 1] = adjustment
+        logits = logits + adjustment_vector
+
+        dist = Categorical(logits=logits)
+        action = dist.sample()
+        log_prob = dist.log_prob(action)
+
+        return action.item(), log_prob.detach(), value.detach().squeeze(0), True
+
+    def store_transition(self, state, action, reward, log_prob, value, done, from_policy=True):
+        if not from_policy:
             return
-            
-        batch = random.sample(self.memory, self.batch_size)
-        
-        # Optimized tensor conversion to avoid warning
-        states_array = np.array([e[0] for e in batch])
-        actions_array = np.array([e[1] for e in batch])
-        rewards_array = np.array([e[2] for e in batch])
-        next_states_array = np.array([e[3] for e in batch])
-        dones_array = np.array([e[4] for e in batch])
-        
-        states = torch.FloatTensor(states_array).to(self.device)
-        actions = torch.LongTensor(actions_array).to(self.device)
-        rewards = torch.FloatTensor(rewards_array).to(self.device)
-        next_states = torch.FloatTensor(next_states_array).to(self.device)
-        dones = torch.BoolTensor(dones_array).to(self.device)
-        
-        current_q_values = self.q_network(states).gather(1, actions.unsqueeze(1))
-        next_q_values = self.target_network(next_states).max(1)[0].detach()
-        target_q_values = rewards + (next_q_values * 0.99 * ~dones)
-        
-        loss = nn.MSELoss()(current_q_values.squeeze(), target_q_values)
-        
-        self.optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), 1.0)
-        self.optimizer.step()
-        
+
+        log_prob_value = float(log_prob) if log_prob is not None else 0.0
+        value_float = float(value)
+        self.buffer.add(state, action, reward, log_prob_value, value_float, done)
+        self.total_samples += 1
+
+    def should_update(self):
+        return len(self.buffer) >= self.update_interval
+
+    def _compute_returns_and_advantages(self):
+        returns = []
+        advantages = []
+        gae = 0.0
+        next_value = 0.0
+
+        for step in reversed(range(len(self.buffer))):
+            reward = self.buffer.rewards[step]
+            value = self.buffer.values[step]
+            done = self.buffer.dones[step]
+
+            if done:
+                next_value = 0.0
+
+            delta = reward + self.gamma * next_value * (1 - done) - value
+            gae = delta + self.gamma * self.gae_lambda * (1 - done) * gae
+            returns.insert(0, gae + value)
+            advantages.insert(0, gae)
+
+            next_value = value
+
+        advantages = np.array(advantages, dtype=np.float32)
+        returns = np.array(returns, dtype=np.float32)
+
+        # Normalize advantages for stability
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        return returns, advantages
+
+    def update(self):
+        if len(self.buffer) == 0:
+            return
+
+        returns, advantages = self._compute_returns_and_advantages()
+
+        states = torch.FloatTensor(np.array(self.buffer.states)).to(self.device)
+        actions = torch.LongTensor(self.buffer.actions).to(self.device)
+        old_log_probs = torch.FloatTensor(self.buffer.log_probs).to(self.device)
+        returns = torch.FloatTensor(returns).to(self.device)
+        advantages = torch.FloatTensor(advantages).to(self.device)
+
+        dataset_size = states.size(0)
+        mini_batch = min(self.mini_batch_size, dataset_size)
+        if mini_batch <= 0:
+            self.buffer.clear()
+            return
+
+        for _ in range(self.update_epochs):
+            permutation = torch.randperm(dataset_size)
+            for start_idx in range(0, dataset_size, mini_batch):
+                idx = permutation[start_idx:start_idx + mini_batch]
+
+                batch_states = states[idx]
+                batch_actions = actions[idx]
+                batch_returns = returns[idx]
+                batch_advantages = advantages[idx]
+                batch_old_log_probs = old_log_probs[idx]
+
+                logits, values = self.model(batch_states)
+                dist = Categorical(logits=logits)
+                new_log_probs = dist.log_prob(batch_actions)
+                entropy = dist.entropy().mean()
+
+                ratio = torch.exp(new_log_probs - batch_old_log_probs)
+                surr1 = ratio * batch_advantages
+                surr2 = torch.clamp(ratio, 1.0 - self.clip_range, 1.0 + self.clip_range) * batch_advantages
+                actor_loss = -torch.min(surr1, surr2).mean()
+
+                value_loss = nn.MSELoss()(values.squeeze(-1), batch_returns)
+
+                loss = actor_loss + self.value_coef * value_loss - self.entropy_coef * entropy
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+                self.optimizer.step()
+
+        self.buffer.clear()
         self.training_steps += 1
-        
-        if self.training_steps % self.target_update == 0:
-            self.update_target_network()
-            
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
 
 class MQTTSensorReader:
     def __init__(self, puf_interface):
@@ -159,8 +242,8 @@ class MQTTSensorReader:
         self.log_file = f"sensor_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         self.performance_file = f"performance_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         
-        # DQN Agent
-        self.dqn_agent = DQNAgent(state_size=12)
+        # PPO Agent
+        self.ppo_agent = PPOAgent(state_size=12)
         self.max_delay = 300  # Maximum deadline (blood_pressure)
         
         # Priority levels
@@ -261,8 +344,26 @@ class MQTTSensorReader:
         """Perform graceful shutdown"""
         self.shutdown_flag.set()
         
-        # Save DQN model
-        torch.save(self.dqn_agent.q_network.state_dict(), f"dqn_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pth")
+        # Save PPO actor-critic model
+        model_path = f"ppo_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pth"
+        torch.save({
+            "model_state_dict": self.ppo_agent.model.state_dict(),
+            "optimizer_state_dict": self.ppo_agent.optimizer.state_dict(),
+            "training_steps": self.ppo_agent.training_steps,
+            "total_samples": self.ppo_agent.total_samples,
+            "hyperparameters": {
+                "gamma": self.ppo_agent.gamma,
+                "gae_lambda": self.ppo_agent.gae_lambda,
+                "clip_range": self.ppo_agent.clip_range,
+                "entropy_coef": self.ppo_agent.entropy_coef,
+                "value_coef": self.ppo_agent.value_coef,
+                "update_epochs": self.ppo_agent.update_epochs,
+                "mini_batch_size": self.ppo_agent.mini_batch_size,
+                "update_interval": self.ppo_agent.update_interval,
+                "learning_rate": self.ppo_agent.learning_rate
+            }
+        }, model_path)
+        self.log_to_file(f"Saved PPO model to {model_path}")
         
         # Log final statistics
         self.log_deadline_statistics()
@@ -317,7 +418,7 @@ class MQTTSensorReader:
             return 1.0  # Low priority for good battery
     
     def get_state(self, sensor_type, location, current_time, time_since_last, remaining_time, sensor_value=None, battery_level=100):
-        """Generate state vector for DQN"""
+        """Generate state vector for the PPO agent"""
         try:
             # Basic features
             time_ratio = remaining_time / self.max_delay
@@ -326,7 +427,7 @@ class MQTTSensorReader:
             location_norm = self.location_priority.get(location, 1.0) / 4.0
             time_of_day = (current_time % 86400) / 86400
             time_since_norm = min(time_since_last / self.max_delay, 1.0)
-            training_progress = min(float(self.dqn_agent.training_steps) / 1000.0, 1.0)
+            training_progress = min(float(self.ppo_agent.training_steps) / 1000.0, 1.0)
             noise = random.random()
             
             # Circular time features
@@ -362,7 +463,7 @@ class MQTTSensorReader:
             return np.zeros(12)
     
     def calculate_reward(self, action, sensor_type, location, time_remaining, sensor_value, battery_level):
-        """Calculate reward for DQN training"""
+        """Calculate reward for PPO training"""
         try:
             base_priority = self.sensor_priority.get(sensor_type, 1.0) * self.location_priority.get(location, 1.0)
             time_ratio = max(time_remaining / self.max_delay, 0.0)
@@ -440,47 +541,48 @@ class MQTTSensorReader:
         with open(self.performance_file, 'a', encoding='utf-8') as f:
             f.write(f"[{timestamp}] RAM: {ram_mb:.2f} MB, Processing Rate: {processing_rate:.2f} msg/sec, Packet Loss: {packet_loss_rate:.2f}%, Sensors Read: {self.sensors_read_count}, Sensors Processed: {self.sensors_processed_count}, Critical Sensors: {self.critical_sensors_count}\n")
     
-    def log_dqn_neural_network_parameters(self):
-        """Log DQN neural network parameters and state"""
+    def log_ppo_actor_critic_parameters(self):
+        """Log PPO actor-critic parameters and state"""
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         with open(self.performance_file, 'a', encoding='utf-8') as f:
-            f.write(f"\n[{timestamp}] DQN NEURAL NETWORK PARAMETERS:\n")
+            f.write(f"\n[{timestamp}] PPO ACTOR-CRITIC PARAMETERS:\n")
             f.write("="*80 + "\n")
-            
+
             # Network architecture
-            f.write(f"Network Architecture:\n")
-            f.write(f"- State Size: {self.dqn_agent.state_size}\n")
-            f.write(f"- Action Size: {self.dqn_agent.action_size}\n")
+            f.write("Network Architecture:\n")
+            f.write(f"- State Size: {self.ppo_agent.state_size}\n")
+            f.write(f"- Action Size: {self.ppo_agent.action_size}\n")
             f.write(f"- Hidden Size: 64\n")
-            f.write(f"- Device: {self.dqn_agent.device}\n")
-            
+            f.write(f"- Device: {self.ppo_agent.device}\n")
+
             # Training parameters
-            f.write(f"\nTraining Parameters:\n")
-            f.write(f"- Learning Rate: {self.dqn_agent.learning_rate}\n")
-            f.write(f"- Batch Size: {self.dqn_agent.batch_size}\n")
-            f.write(f"- Memory Size: {len(self.dqn_agent.memory)}/{self.dqn_agent.memory.maxlen}\n")
-            f.write(f"- Training Steps: {self.dqn_agent.training_steps}\n")
-            f.write(f"- Target Update Frequency: {self.dqn_agent.target_update}\n")
-            
-            # Exploration parameters
-            f.write(f"\nExploration Parameters:\n")
-            f.write(f"- Current Epsilon: {self.dqn_agent.epsilon:.6f}\n")
-            f.write(f"- Epsilon Min: {self.dqn_agent.epsilon_min}\n")
-            f.write(f"- Epsilon Decay: {self.dqn_agent.epsilon_decay}\n")
-            
+            f.write("\nTraining Parameters:\n")
+            f.write(f"- Learning Rate: {self.ppo_agent.learning_rate}\n")
+            f.write(f"- Discount Factor (gamma): {self.ppo_agent.gamma}\n")
+            f.write(f"- GAE Lambda: {self.ppo_agent.gae_lambda}\n")
+            f.write(f"- Clip Range: {self.ppo_agent.clip_range}\n")
+            f.write(f"- Entropy Coefficient: {self.ppo_agent.entropy_coef}\n")
+            f.write(f"- Value Coefficient: {self.ppo_agent.value_coef}\n")
+            f.write(f"- Update Epochs: {self.ppo_agent.update_epochs}\n")
+            f.write(f"- Mini-batch Size: {self.ppo_agent.mini_batch_size}\n")
+            f.write(f"- Update Interval: {self.ppo_agent.update_interval}\n")
+            f.write(f"- Warmup Steps: {self.ppo_agent.warmup_steps}\n")
+            f.write(f"- PPO Updates: {self.ppo_agent.training_steps}\n")
+            f.write(f"- Samples Collected: {self.ppo_agent.total_samples}\n")
+
             # Network weights statistics
-            f.write(f"\nMain Network Weights Statistics:\n")
-            for name, param in self.dqn_agent.q_network.named_parameters():
+            f.write("\nModel Weights Statistics:\n")
+            for name, param in self.ppo_agent.model.named_parameters():
                 if param.requires_grad:
                     weight_mean = param.data.mean().item()
                     weight_std = param.data.std().item()
                     weight_min = param.data.min().item()
                     weight_max = param.data.max().item()
                     f.write(f"- {name}: Mean={weight_mean:.6f}, Std={weight_std:.6f}, Min={weight_min:.6f}, Max={weight_max:.6f}\n")
-            
+
             # Gradients statistics (if available)
-            f.write(f"\nGradient Statistics:\n")
-            for name, param in self.dqn_agent.q_network.named_parameters():
+            f.write("\nGradient Statistics:\n")
+            for name, param in self.ppo_agent.model.named_parameters():
                 if param.requires_grad and param.grad is not None:
                     grad_mean = param.grad.mean().item()
                     grad_std = param.grad.std().item()
@@ -488,7 +590,7 @@ class MQTTSensorReader:
                     f.write(f"- {name} gradient: Mean={grad_mean:.6f}, Std={grad_std:.6f}, Norm={grad_norm:.6f}\n")
                 else:
                     f.write(f"- {name} gradient: No gradient available\n")
-            
+
             f.write("="*80 + "\n\n")
     
     def log_deadline_statistics(self):
@@ -508,11 +610,11 @@ class MQTTSensorReader:
             f.write(f"تعداد انتقال موفق: {total_successful}\n")
             f.write(f"کل خوانش‌ها: {total_reads}\n")
             f.write(f"تعداد deadline های از دست رفته: {total_missed}\n")
-            f.write(f"DQN Training Steps: {self.dqn_agent.training_steps}\n")
-            f.write(f"Current Epsilon: {self.dqn_agent.epsilon:.4f}\n")
-            
+            f.write(f"PPO Updates: {self.ppo_agent.training_steps}\n")
+            f.write(f"Samples Collected: {self.ppo_agent.total_samples}\n")
+
             # Log neural network parameters
-            self.log_dqn_neural_network_parameters()
+            self.log_ppo_actor_critic_parameters()
             
             # Delay statistics
             f.write("\nآمار تاخیر (ثانیه):\n")
@@ -710,7 +812,7 @@ class MQTTSensorReader:
                 self.messages_failed += 1
     
     def handle_sensor_data(self, topic, data):
-        """Handle sensor data using DQN decision making"""
+        """Handle sensor data using PPO decision making"""
         try:
             sensor_id = data.get('sensor_id', 'unknown')
             sensor_type = data.get('sensor_type', 'unknown')
@@ -749,25 +851,26 @@ class MQTTSensorReader:
                 # Generate state vector
                 state = self.get_state(sensor_type, location, current_time, time_since_last, remaining_time, value, sensor_bat)
                 
-                # Get DQN decision
-                action = self.dqn_agent.act(
-                    state, 
-                    self.sensor_priority.get(sensor_type, 1.0), 
+                # Get PPO decision
+                action, log_prob, state_value, from_policy = self.ppo_agent.act(
+                    state,
+                    self.sensor_priority.get(sensor_type, 1.0),
                     self.location_priority.get(location, 1.0)
                 )
-                
+
                 # Calculate reward for training
                 reward = self.calculate_reward(action, sensor_type, location, remaining_time, value, sensor_bat)
-                
-                # Store experience for training (simplified - using current state as next_state)
+
+                # Store experience for training
                 done = remaining_time <= 0
-                self.dqn_agent.remember(state, action, reward, state, done)
-                
-                # Train the agent
-                if len(self.dqn_agent.memory) > self.dqn_agent.batch_size:
-                    self.dqn_agent.replay()
-                
-                decision_type = "[DQN]"
+                value_item = state_value.item() if state_value is not None else 0.0
+                self.ppo_agent.store_transition(state, action, reward, log_prob, value_item, done, from_policy)
+
+                # Train the agent when enough samples collected
+                if self.ppo_agent.should_update():
+                    self.ppo_agent.update()
+
+                decision_type = "[PPO]" if from_policy else "[PPO-HEURISTIC]"
             
             # Update tracking
             current_time_dt = datetime.now()
@@ -1078,7 +1181,7 @@ def select_serial_port():
             print("Invalid input. Please enter a number.")
 
 def main():
-    print("MQTT Sensor Data Reader with PUF Obfuscation - DQN Priority System (Silent Mode - Optimized)")
+    print("MQTT Sensor Data Reader with PUF Obfuscation - PPO Actor-Critic Priority System (Silent Mode - Optimized)")
     print("Date: 2025-09-14")
     print("User: foladlo")
     print("="*60)
@@ -1107,7 +1210,7 @@ def main():
     
     mqtt_reader = MQTTSensorReader(puf)
     
-    mqtt_reader.log_to_file("MQTT Sensor Data Reader with DQN Priority System (Silent Mode - Optimized) started")
+    mqtt_reader.log_to_file("MQTT Sensor Data Reader with PPO Actor-Critic Priority System (Silent Mode - Optimized) started")
     mqtt_reader.log_to_file(f"Selected port: {selected_port}")
     mqtt_reader.log_to_file(f"Temperature table size: {puf.get_temp_table_size()}")
     mqtt_reader.log_to_file(f"Heart rate table size: {puf.get_hr_table_size()}")
@@ -1130,14 +1233,14 @@ def main():
     
     if mqtt_reader.connect_mqtt(broker_host, broker_port):
         print("Connected to MQTT broker successfully!")
-        print("\nDQN Priority System Active (Silent Mode - Optimized):")
+        print("\nPPO Actor-Critic Priority System Active (Silent Mode - Optimized):")
         print("- PyTorch tensor optimization applied")
         print("- Reduced monitoring frequencies")
         print("- Emergency deadline override implemented")
         print("- Smaller batch sizes for faster training")
-        print("- Press Ctrl+C to stop and save DQN model...")
+        print("- Press Ctrl+C to stop and save PPO model...")
         
-        mqtt_reader.log_to_file("Connected to MQTT broker successfully with DQN priority system (Silent Mode - Optimized)!")
+        mqtt_reader.log_to_file("Connected to MQTT broker successfully with PPO actor-critic priority system (Silent Mode - Optimized)!")
         
         try:
             mqtt_reader.start_listening()
